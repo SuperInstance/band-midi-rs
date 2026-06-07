@@ -1,682 +1,211 @@
-//! MIDI I/O, tensor mapping, and groove timing for autonomous band agents.
-//!
-//! This crate provides:
-//! - [`note`]: MIDI note structures and encoding/decoding
-//! - [`tensor_map`]: Tensor representations of MIDI events for ML pipelines
-//! - [`groove`]: Swing, humanization, and quantization engine
-//! - [`clock_sync`]: MIDI clock synchronization state machine
-//! - [`io`]: Software MIDI buffer for event scheduling and encoding
+#![forbid(unsafe_code)]
 
-// ─────────────────────────────── note ───────────────────────────────────────
+use core::f64::consts::TAU;
 
-/// MIDI note structures and event types.
-pub mod note {
-    /// A single MIDI note with pitch, velocity, duration, and channel.
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct Note {
-        /// MIDI pitch value (0–127).
-        pub pitch: u8,
-        /// MIDI velocity value (0–127). A value of 0 indicates silence.
-        pub velocity: u8,
-        /// Note duration in seconds.
-        pub duration: f64,
-        /// MIDI channel (0–15).
-        pub channel: u8,
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MidiMessage {
+    NoteOn          { channel: u8, pitch: u8, velocity: u8 },
+    NoteOff         { channel: u8, pitch: u8, velocity: u8 },
+    PolyPressure    { channel: u8, pitch: u8, pressure: u8 },
+    ControlChange   { channel: u8, controller: u8, value: u8 },
+    ProgramChange   { channel: u8, program: u8 },
+    ChannelPressure { channel: u8, pressure: u8 },
+    PitchBend       { channel: u8, value: i16 },
+    TimingClock,
+    Start,
+    Continue,
+    Stop,
+    ActiveSensing,
+    Reset,
+}
 
-    /// A MIDI Note On event.
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct NoteOn {
-        /// MIDI pitch value (0–127).
-        pub pitch: u8,
-        /// MIDI velocity value (0–127).
-        pub velocity: u8,
-        /// MIDI channel (0–15).
-        pub channel: u8,
-        /// Event timestamp in seconds.
-        pub timestamp: f64,
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MidiError {
+    EmptyBuffer,
+    UnknownStatus(u8),
+    BufferTooShort { needed: usize, got: usize },
+}
 
-    /// A MIDI Note Off event.
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct NoteOff {
-        /// MIDI pitch value (0–127).
-        pub pitch: u8,
-        /// MIDI channel (0–15).
-        pub channel: u8,
-        /// Event timestamp in seconds.
-        pub timestamp: f64,
-    }
-
-    /// A MIDI event discriminant covering the most common message types.
-    #[derive(Debug, Clone, PartialEq)]
-    pub enum MidiEvent {
-        /// A note-on message.
-        NoteOn(NoteOn),
-        /// A note-off message.
-        NoteOff(NoteOff),
-        /// A MIDI timing clock pulse (24 per quarter note).
-        Clock,
-        /// A MIDI Start message.
-        Start,
-        /// A MIDI Stop message.
-        Stop,
-        /// A MIDI Continue message.
-        Continue,
-    }
-
-    impl Note {
-        /// Create a new [`Note`].
-        pub fn new(pitch: u8, velocity: u8, duration: f64, channel: u8) -> Self {
-            Self { pitch, velocity, duration, channel }
-        }
-
-        /// Return the pitch class (0–11) by computing `pitch % 12`.
-        pub fn pitch_class(&self) -> u8 {
-            self.pitch % 12
-        }
-
-        /// Return the octave number by computing `pitch / 12`.
-        pub fn octave(&self) -> u8 {
-            self.pitch / 12
-        }
-
-        /// Return `true` if velocity is 0 (silent note).
-        pub fn is_silence(&self) -> bool {
-            self.velocity == 0
-        }
-
-        /// Encode the note as a 3-byte MIDI Note On message.
-        ///
-        /// Returns `[status, pitch, velocity]` where status = `0x90 | channel`.
-        pub fn encode(&self) -> [u8; 3] {
-            [0x90 | (self.channel & 0x0F), self.pitch, self.velocity]
-        }
-
-        /// Attempt to decode a 3-byte MIDI Note On message into a [`Note`].
-        ///
-        /// Returns `None` if the status byte is not a Note On message (`0x90`–`0x9F`).
-        pub fn decode(bytes: [u8; 3], duration: f64) -> Option<Self> {
-            let status = bytes[0];
-            if status & 0xF0 == 0x90 {
-                let channel = status & 0x0F;
-                Some(Self::new(bytes[1], bytes[2], duration, channel))
-            } else {
-                None
-            }
+impl core::fmt::Display for MidiError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::EmptyBuffer => write!(f, "empty buffer"),
+            Self::UnknownStatus(s) => write!(f, "unknown status 0x{s:02x}"),
+            Self::BufferTooShort { needed, got } => write!(f, "need {needed} bytes, got {got}"),
         }
     }
 }
 
-// ─────────────────────────────── tensor_map ──────────────────────────────────
-
-/// Tensor representations of MIDI events for ML/DSP pipelines.
-pub mod tensor_map {
-    use crate::note::Note;
-
-    /// A single tensor-encoded MIDI event.
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct TensorEvent {
-        /// Pitch class (0–11), derived from the note's MIDI pitch.
-        pub dimension: u8,
-        /// Normalised velocity in `[0, 1]` (velocity / 127.0).
-        pub weight: f64,
-        /// Rhythm pattern encoded as 4 floats (one per 16th note in a beat).
-        pub kernel: [f64; 4],
-    }
-
-    /// A collection of simultaneous [`TensorEvent`]s representing a chord or
-    /// cluster of notes at a single point in time.
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct TensorSlice {
-        /// All events that occur simultaneously.
-        pub events: Vec<TensorEvent>,
-    }
-
-    /// An ordered sequence of timestamped [`TensorSlice`]s.
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct TensorSequence {
-        /// `(timestamp_seconds, slice)` pairs in chronological order.
-        pub slices: Vec<(f64, TensorSlice)>,
-    }
-
-    impl TensorEvent {
-        /// Build a [`TensorEvent`] from a [`Note`] and a 4-element rhythm pattern.
-        pub fn from_note(note: &Note, rhythm_pattern: [f64; 4]) -> Self {
-            Self {
-                dimension: note.pitch_class(),
-                weight: note.velocity as f64 / 127.0,
-                kernel: rhythm_pattern,
+impl MidiMessage {
+    /// Parse from raw bytes. Returns (message, bytes_consumed).
+    pub fn parse(bytes: &[u8]) -> Result<(Self, usize), MidiError> {
+        if bytes.is_empty() { return Err(MidiError::EmptyBuffer); }
+        let status = bytes[0];
+        let ch = status & 0x0F;
+        let need = |n: usize| -> Result<(), MidiError> {
+            if bytes.len() < n { Err(MidiError::BufferTooShort { needed: n, got: bytes.len() }) } else { Ok(()) }
+        };
+        match status & 0xF0 {
+            0x80 => { need(3)?; Ok((MidiMessage::NoteOff { channel: ch, pitch: bytes[1], velocity: bytes[2] }, 3)) }
+            0x90 => { need(3)?; Ok((MidiMessage::NoteOn  { channel: ch, pitch: bytes[1], velocity: bytes[2] }, 3)) }
+            0xA0 => { need(3)?; Ok((MidiMessage::PolyPressure { channel: ch, pitch: bytes[1], pressure: bytes[2] }, 3)) }
+            0xB0 => { need(3)?; Ok((MidiMessage::ControlChange { channel: ch, controller: bytes[1], value: bytes[2] }, 3)) }
+            0xC0 => { need(2)?; Ok((MidiMessage::ProgramChange { channel: ch, program: bytes[1] }, 2)) }
+            0xD0 => { need(2)?; Ok((MidiMessage::ChannelPressure { channel: ch, pressure: bytes[1] }, 2)) }
+            0xE0 => {
+                need(3)?;
+                let raw = ((bytes[2] as i16) << 7) | (bytes[1] as i16);
+                Ok((MidiMessage::PitchBend { channel: ch, value: raw - 8192 }, 3))
             }
-        }
-
-        /// Compute the dot product of two [`TensorEvent`]s.
-        ///
-        /// Combines weight product with the inner product of their kernels.
-        pub fn dot_product(&self, other: &TensorEvent) -> f64 {
-            let kernel_dot: f64 = self
-                .kernel
-                .iter()
-                .zip(other.kernel.iter())
-                .map(|(a, b)| a * b)
-                .sum();
-            self.weight * other.weight + kernel_dot
+            0xF0 => match status {
+                0xF8 => Ok((MidiMessage::TimingClock, 1)),
+                0xFA => Ok((MidiMessage::Start, 1)),
+                0xFB => Ok((MidiMessage::Continue, 1)),
+                0xFC => Ok((MidiMessage::Stop, 1)),
+                0xFE => Ok((MidiMessage::ActiveSensing, 1)),
+                0xFF => Ok((MidiMessage::Reset, 1)),
+                _ => Err(MidiError::UnknownStatus(status)),
+            },
+            _ => Err(MidiError::UnknownStatus(status)),
         }
     }
 
-    impl TensorSlice {
-        /// Build a [`TensorSlice`] from a slice of notes and a shared rhythm pattern.
-        pub fn from_notes(notes: &[Note], rhythm_pattern: [f64; 4]) -> Self {
-            Self {
-                events: notes
-                    .iter()
-                    .map(|n| TensorEvent::from_note(n, rhythm_pattern))
-                    .collect(),
+    pub fn to_bytes(&self) -> Vec<u8> {
+        match self {
+            Self::NoteOn    { channel, pitch, velocity } => vec![0x90 | channel, *pitch, *velocity],
+            Self::NoteOff   { channel, pitch, velocity } => vec![0x80 | channel, *pitch, *velocity],
+            Self::PolyPressure { channel, pitch, pressure } => vec![0xA0 | channel, *pitch, *pressure],
+            Self::ControlChange { channel, controller, value } => vec![0xB0 | channel, *controller, *value],
+            Self::ProgramChange { channel, program } => vec![0xC0 | channel, *program],
+            Self::ChannelPressure { channel, pressure } => vec![0xD0 | channel, *pressure],
+            Self::PitchBend { channel, value } => {
+                let raw = (*value + 8192) as u16;
+                vec![0xE0 | channel, (raw & 0x7F) as u8, ((raw >> 7) & 0x7F) as u8]
             }
-        }
-
-        /// Sum of all event weights in this slice.
-        pub fn activation_sum(&self) -> f64 {
-            self.events.iter().map(|e| e.weight).sum()
-        }
-    }
-
-    impl TensorSequence {
-        /// Create an empty [`TensorSequence`].
-        pub fn new() -> Self {
-            Self { slices: Vec::new() }
-        }
-
-        /// Append a slice at the given timestamp.
-        pub fn push(&mut self, timestamp: f64, slice: TensorSlice) {
-            self.slices.push((timestamp, slice));
-        }
-
-        /// Sum of all event weights across all slices.
-        pub fn total_weight(&self) -> f64 {
-            self.slices
-                .iter()
-                .flat_map(|(_, s)| s.events.iter())
-                .map(|e| e.weight)
-                .sum()
-        }
-    }
-
-    impl Default for TensorSequence {
-        fn default() -> Self {
-            Self::new()
+            Self::TimingClock  => vec![0xF8],
+            Self::Start        => vec![0xFA],
+            Self::Continue     => vec![0xFB],
+            Self::Stop         => vec![0xFC],
+            Self::ActiveSensing => vec![0xFE],
+            Self::Reset        => vec![0xFF],
         }
     }
 }
 
-// ─────────────────────────────── groove ──────────────────────────────────────
+/// 3D tensor coordinate: pitch [0,1], velocity [0,1], phase [0, 2π).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TensorCoord {
+    pub pitch_norm: f64,
+    pub vel_norm: f64,
+    pub phase: f64,
+}
 
-/// Swing, humanization, and beat-grid quantization engine.
-pub mod groove {
-    /// Applies swing feel, subtle timing variations, and quantization to a
-    /// beat grid.
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct GrooveEngine {
-        /// Swing amount in `[0, 0.5]`. `0` = straight, `0.5` = full triplet feel.
-        pub swing: f64,
-        /// Maximum random humanization offset in milliseconds.
-        pub humanize: f64,
-        /// Tempo in beats per minute.
-        pub tempo_bpm: f64,
+impl TensorCoord {
+    pub fn new(pitch_norm: f64, vel_norm: f64, phase: f64) -> Self {
+        TensorCoord { pitch_norm, vel_norm, phase }
     }
 
-    impl GrooveEngine {
-        /// Create a new [`GrooveEngine`] with the given tempo and sensible
-        /// defaults: `swing = 0.1`, `humanize = 5.0 ms`.
-        pub fn new(tempo_bpm: f64) -> Self {
-            Self { swing: 0.1, humanize: 5.0, tempo_bpm }
-        }
-
-        /// Duration of a single beat in milliseconds at the current tempo.
-        pub fn beat_duration_ms(&self) -> f64 {
-            60_000.0 / self.tempo_bpm
-        }
-
-        /// Compute the timing offset (in ms) for `beat_index` using swing and
-        /// deterministic humanization derived from `seed`.
-        ///
-        /// - Even-indexed beats are pushed *forward* by `swing × beat_duration_ms`.
-        /// - Odd-indexed beats are pushed *backward* by the same amount.
-        /// - A deterministic humanize jitter is added: `(seed % 1000) / 1000 * humanize - humanize/2`.
-        pub fn beat_offset(&self, beat_index: u64, seed: u64) -> f64 {
-            let beat_ms = self.beat_duration_ms();
-            let swing_offset = if beat_index.is_multiple_of(2) {
-                self.swing * beat_ms
-            } else {
-                -(self.swing * beat_ms)
-            };
-            let human_offset =
-                (seed % 1000) as f64 / 1000.0 * self.humanize - self.humanize / 2.0;
-            swing_offset + human_offset
-        }
-
-        /// Snap `timestamp_ms` to the nearest beat grid position.
-        pub fn quantize(&self, timestamp_ms: f64) -> f64 {
-            let beat_ms = self.beat_duration_ms();
-            (timestamp_ms / beat_ms).round() * beat_ms
-        }
+    pub fn distance(&self, other: &Self) -> f64 {
+        let dp = self.pitch_norm - other.pitch_norm;
+        let dv = self.vel_norm   - other.vel_norm;
+        let dph = (self.phase - other.phase) / TAU;
+        (dp * dp + dv * dv + dph * dph).sqrt()
     }
 }
 
-// ─────────────────────────────── clock_sync ──────────────────────────────────
-
-/// MIDI clock synchronization state machine.
-///
-/// MIDI clock sends 24 ticks per quarter note; this module tracks those ticks
-/// to derive the external tempo.
-pub mod clock_sync {
-    /// Tracks incoming MIDI clock ticks and derives BPM from tick intervals.
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct ClockSync {
-        /// `true` when a MIDI Start message has been received.
-        pub is_synced: bool,
-        /// Derived external BPM once 24 ticks have been received.
-        pub external_bpm: Option<f64>,
-        /// Running tick counter (resets every 24 ticks).
-        pub tick_count: u64,
-        /// Timestamp of the first tick in the current 24-tick window.
-        pub last_tick_time: f64,
-    }
-
-    impl ClockSync {
-        /// Create a new, unsynced [`ClockSync`] instance.
-        pub fn new() -> Self {
-            Self {
-                is_synced: false,
-                external_bpm: None,
-                tick_count: 0,
-                last_tick_time: 0.0,
-            }
-        }
-
-        /// Process a single MIDI clock tick arriving at `time` (seconds).
-        ///
-        /// Every 24 ticks a new BPM estimate is computed and the window resets.
-        pub fn on_clock_tick(&mut self, time: f64) {
-            if self.tick_count == 0 {
-                self.last_tick_time = time;
-            }
-            self.tick_count += 1;
-            if self.tick_count >= 24 {
-                let elapsed = time - self.last_tick_time;
-                if elapsed > 0.0 {
-                    self.external_bpm = Some(60.0 * 24.0 / elapsed);
-                }
-                self.tick_count = 0;
-                self.last_tick_time = time;
-            }
-        }
-
-        /// Handle a MIDI Start message: mark as synced and reset the tick counter.
-        pub fn on_start(&mut self) {
-            self.is_synced = true;
-            self.tick_count = 0;
-        }
-
-        /// Handle a MIDI Stop message: mark as unsynced.
-        pub fn on_stop(&mut self) {
-            self.is_synced = false;
-        }
-
-        /// Return the current external BPM if the clock is synced.
-        pub fn current_bpm(&self) -> Option<f64> {
-            if self.is_synced { self.external_bpm } else { None }
-        }
-    }
-
-    impl Default for ClockSync {
-        fn default() -> Self {
-            Self::new()
-        }
+pub fn midi_to_tensor(msg: &MidiMessage, time_phase: f64) -> Option<TensorCoord> {
+    let phase = time_phase % TAU;
+    match msg {
+        MidiMessage::NoteOn  { pitch, velocity, .. } |
+        MidiMessage::NoteOff { pitch, velocity, .. } =>
+            Some(TensorCoord::new(*pitch as f64 / 127.0, *velocity as f64 / 127.0, phase)),
+        MidiMessage::ControlChange { controller, value, .. } =>
+            Some(TensorCoord::new(*controller as f64 / 127.0, *value as f64 / 127.0, phase)),
+        _ => None,
     }
 }
-
-// ─────────────────────────────── io ──────────────────────────────────────────
-
-/// Software MIDI event buffer for scheduling and encoding events.
-///
-/// No hardware I/O is performed; this module provides an in-memory store
-/// suitable for offline rendering, testing, and agent communication.
-pub mod io {
-    use crate::note::MidiEvent;
-
-    /// An in-memory buffer of timestamped [`MidiEvent`]s.
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct MidiBuffer {
-        /// `(timestamp_seconds, event)` pairs.
-        pub events: Vec<(f64, MidiEvent)>,
-    }
-
-    impl MidiBuffer {
-        /// Create an empty [`MidiBuffer`].
-        pub fn new() -> Self {
-            Self { events: Vec::new() }
-        }
-
-        /// Append an event at `timestamp` (seconds).
-        pub fn push(&mut self, timestamp: f64, event: MidiEvent) {
-            self.events.push((timestamp, event));
-        }
-
-        /// Return references to all events whose timestamp falls in `[start, end)`.
-        pub fn events_in_range(&self, start: f64, end: f64) -> Vec<&MidiEvent> {
-            self.events
-                .iter()
-                .filter(|(t, _)| *t >= start && *t < end)
-                .map(|(_, e)| e)
-                .collect()
-        }
-
-        /// Encode all `NoteOn` events in the buffer to raw MIDI bytes (3 bytes each).
-        ///
-        /// Other event types are skipped.
-        pub fn encode_buffer(&self) -> Vec<u8> {
-            let mut out = Vec::new();
-            for (_, event) in &self.events {
-                if let MidiEvent::NoteOn(on) = event {
-                    out.push(0x90 | (on.channel & 0x0F));
-                    out.push(on.pitch);
-                    out.push(on.velocity);
-                }
-            }
-            out
-        }
-
-        /// Remove all events from the buffer.
-        pub fn clear(&mut self) {
-            self.events.clear();
-        }
-    }
-
-    impl Default for MidiBuffer {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
-}
-
-// ─────────────────────────────── tests ───────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
-    use super::clock_sync::ClockSync;
-    use super::groove::GrooveEngine;
-    use super::io::MidiBuffer;
-    use super::note::{MidiEvent, Note, NoteOff, NoteOn};
-    use super::tensor_map::{TensorEvent, TensorSequence, TensorSlice};
+    use super::*;
+    use core::f64::consts::PI;
 
-    // ── note ────────────────────────────────────────────────────────────────
+    fn rt(msg: &MidiMessage) -> MidiMessage { MidiMessage::parse(&msg.to_bytes()).unwrap().0 }
 
-    #[test]
-    fn note_new() {
-        let n = Note::new(60, 100, 1.0, 0);
-        assert_eq!(n.pitch, 60);
-        assert_eq!(n.velocity, 100);
-        assert_eq!(n.duration, 1.0);
-        assert_eq!(n.channel, 0);
+    #[test] fn note_on_round_trip() {
+        let m = MidiMessage::NoteOn { channel: 0, pitch: 60, velocity: 100 };
+        assert_eq!(rt(&m), m);
     }
-
-    #[test]
-    fn note_pitch_class_c() {
-        // Middle C (MIDI 60) has pitch class 0
-        let n = Note::new(60, 80, 0.5, 0);
-        assert_eq!(n.pitch_class(), 0);
+    #[test] fn note_off_round_trip() {
+        let m = MidiMessage::NoteOff { channel: 1, pitch: 64, velocity: 0 };
+        assert_eq!(rt(&m), m);
     }
-
-    #[test]
-    fn note_pitch_class_a() {
-        // MIDI 57 = A3, pitch class 9
-        let n = Note::new(57, 80, 0.5, 0);
-        assert_eq!(n.pitch_class(), 9);
+    #[test] fn control_change_round_trip() {
+        let m = MidiMessage::ControlChange { channel: 2, controller: 7, value: 100 };
+        assert_eq!(rt(&m), m);
     }
-
-    #[test]
-    fn note_octave_middle_c() {
-        // MIDI 60 / 12 = 5
-        let n = Note::new(60, 80, 0.5, 0);
-        assert_eq!(n.octave(), 5);
+    #[test] fn program_change_round_trip() {
+        let m = MidiMessage::ProgramChange { channel: 0, program: 25 };
+        assert_eq!(rt(&m), m);
     }
-
-    #[test]
-    fn note_is_silence_true() {
-        let n = Note::new(60, 0, 0.5, 0);
-        assert!(n.is_silence());
+    #[test] fn pitch_bend_zero() { assert_eq!(rt(&MidiMessage::PitchBend { channel: 0, value: 0 }), MidiMessage::PitchBend { channel: 0, value: 0 }); }
+    #[test] fn pitch_bend_max_pos() { assert_eq!(rt(&MidiMessage::PitchBend { channel: 0, value: 8191 }), MidiMessage::PitchBend { channel: 0, value: 8191 }); }
+    #[test] fn pitch_bend_max_neg() { assert_eq!(rt(&MidiMessage::PitchBend { channel: 0, value: -8192 }), MidiMessage::PitchBend { channel: 0, value: -8192 }); }
+    #[test] fn timing_clock() { assert_eq!(rt(&MidiMessage::TimingClock), MidiMessage::TimingClock); }
+    #[test] fn start_stop_continue() {
+        assert_eq!(rt(&MidiMessage::Start), MidiMessage::Start);
+        assert_eq!(rt(&MidiMessage::Stop), MidiMessage::Stop);
+        assert_eq!(rt(&MidiMessage::Continue), MidiMessage::Continue);
     }
-
-    #[test]
-    fn note_is_silence_false() {
-        let n = Note::new(60, 64, 0.5, 0);
-        assert!(!n.is_silence());
+    #[test] fn reset_round_trip() { assert_eq!(rt(&MidiMessage::Reset), MidiMessage::Reset); }
+    #[test] fn poly_pressure_round_trip() {
+        let m = MidiMessage::PolyPressure { channel: 3, pitch: 50, pressure: 64 };
+        assert_eq!(rt(&m), m);
     }
-
-    #[test]
-    fn note_encode() {
-        let n = Note::new(60, 100, 1.0, 0);
-        assert_eq!(n.encode(), [0x90, 60, 100]);
+    #[test] fn channel_pressure_round_trip() {
+        let m = MidiMessage::ChannelPressure { channel: 0, pressure: 100 };
+        assert_eq!(rt(&m), m);
     }
-
-    #[test]
-    fn note_encode_channel() {
-        let n = Note::new(69, 90, 1.0, 3);
-        let enc = n.encode();
-        assert_eq!(enc[0], 0x93); // 0x90 | 3
-        assert_eq!(enc[1], 69);
-        assert_eq!(enc[2], 90);
+    #[test] fn parse_empty_err() { assert!(matches!(MidiMessage::parse(&[]), Err(MidiError::EmptyBuffer))); }
+    #[test] fn parse_too_short_err() { assert!(matches!(MidiMessage::parse(&[0x90]), Err(MidiError::BufferTooShort { .. }))); }
+    #[test] fn parse_unknown_status_err() { assert!(matches!(MidiMessage::parse(&[0xF1]), Err(MidiError::UnknownStatus(_)))); }
+    #[test] fn error_display_empty() { assert!(!MidiError::EmptyBuffer.to_string().is_empty()); }
+    #[test] fn note_on_tensor_full() {
+        let m = MidiMessage::NoteOn { channel: 0, pitch: 127, velocity: 127 };
+        let t = midi_to_tensor(&m, 0.0).unwrap();
+        assert!((t.pitch_norm - 1.0).abs() < 1e-9);
+        assert!((t.vel_norm   - 1.0).abs() < 1e-9);
     }
-
-    #[test]
-    fn note_decode_roundtrip() {
-        let n = Note::new(64, 80, 2.0, 1);
-        let bytes = n.encode();
-        let decoded = Note::decode(bytes, 2.0).expect("decode should succeed");
-        assert_eq!(decoded, n);
+    #[test] fn note_on_tensor_zero() {
+        let m = MidiMessage::NoteOn { channel: 0, pitch: 0, velocity: 0 };
+        let t = midi_to_tensor(&m, PI).unwrap();
+        assert!(t.pitch_norm.abs() < 1e-9);
+        assert!((t.phase - PI).abs() < 1e-9);
     }
-
-    #[test]
-    fn note_decode_invalid_status() {
-        // 0x80 is Note Off, not Note On
-        let result = Note::decode([0x80, 60, 0], 1.0);
-        assert!(result.is_none());
+    #[test] fn tensor_distance_self_zero() {
+        let t = TensorCoord::new(0.5, 0.5, PI);
+        assert!(t.distance(&t) < 1e-9);
     }
-
-    #[test]
-    fn midi_event_variants_constructable() {
-        let on = MidiEvent::NoteOn(NoteOn { pitch: 60, velocity: 100, channel: 0, timestamp: 0.0 });
-        let off = MidiEvent::NoteOff(NoteOff { pitch: 60, channel: 0, timestamp: 1.0 });
-        let clock = MidiEvent::Clock;
-        let start = MidiEvent::Start;
-        let stop = MidiEvent::Stop;
-        let cont = MidiEvent::Continue;
-        // just assert they are distinguishable
-        assert_ne!(on, off);
-        assert_eq!(clock, MidiEvent::Clock);
-        assert_eq!(start, MidiEvent::Start);
-        assert_eq!(stop, MidiEvent::Stop);
-        assert_eq!(cont, MidiEvent::Continue);
+    #[test] fn tensor_distance_symmetry() {
+        let a = TensorCoord::new(0.0, 0.0, 0.0);
+        let b = TensorCoord::new(1.0, 1.0, PI);
+        assert!((a.distance(&b) - b.distance(&a)).abs() < 1e-9);
     }
-
-    // ── tensor_map ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn tensor_event_from_note_weight() {
-        let n = Note::new(60, 127, 1.0, 0);
-        let te = TensorEvent::from_note(&n, [0.25; 4]);
-        assert!((te.weight - 1.0).abs() < 1e-9);
+    #[test] fn system_messages_no_tensor() {
+        assert!(midi_to_tensor(&MidiMessage::Start, 0.0).is_none());
+        assert!(midi_to_tensor(&MidiMessage::Stop, 0.0).is_none());
+        assert!(midi_to_tensor(&MidiMessage::Reset, 0.0).is_none());
     }
-
-    #[test]
-    fn tensor_event_from_note_dimension() {
-        // pitch 63 = pitch class 3
-        let n = Note::new(63, 64, 1.0, 0);
-        let te = TensorEvent::from_note(&n, [0.0; 4]);
-        assert_eq!(te.dimension, 3);
-    }
-
-    #[test]
-    fn tensor_event_dot_product() {
-        let n = Note::new(60, 127, 1.0, 0);
-        let a = TensorEvent::from_note(&n, [1.0, 0.0, 0.0, 0.0]);
-        let b = TensorEvent::from_note(&n, [1.0, 0.0, 0.0, 0.0]);
-        // weight*weight + 1*1 + 0+0+0 = 1.0 + 1.0 = 2.0
-        let dp = a.dot_product(&b);
-        assert!((dp - 2.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn tensor_slice_from_notes() {
-        let notes = vec![Note::new(60, 64, 1.0, 0), Note::new(64, 64, 1.0, 0)];
-        let ts = TensorSlice::from_notes(&notes, [0.5; 4]);
-        assert_eq!(ts.events.len(), 2);
-    }
-
-    #[test]
-    fn tensor_slice_activation_sum() {
-        let notes = vec![Note::new(60, 127, 1.0, 0), Note::new(64, 127, 1.0, 0)];
-        let ts = TensorSlice::from_notes(&notes, [0.0; 4]);
-        let sum = ts.activation_sum();
-        assert!((sum - 2.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn tensor_sequence_push_and_total_weight() {
-        let mut seq = TensorSequence::new();
-        let notes = vec![Note::new(60, 127, 1.0, 0)];
-        let sl = TensorSlice::from_notes(&notes, [0.0; 4]);
-        seq.push(0.0, sl.clone());
-        seq.push(0.5, sl);
-        // Two slices each with weight 1.0
-        assert!((seq.total_weight() - 2.0).abs() < 1e-9);
-    }
-
-    // ── groove ──────────────────────────────────────────────────────────────
-
-    #[test]
-    fn groove_beat_duration_120bpm() {
-        let g = GrooveEngine::new(120.0);
-        assert!((g.beat_duration_ms() - 500.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn groove_beat_offset_swing_sign_alternates() {
-        let g = GrooveEngine::new(120.0);
-        // Use seed 0 to eliminate humanize randomness contribution
-        let even = g.beat_offset(0, 0);
-        let odd = g.beat_offset(1, 0);
-        assert!(even > 0.0, "even beat offset should be positive");
-        assert!(odd < 0.0, "odd beat offset should be negative");
-    }
-
-    #[test]
-    fn groove_quantize_snaps() {
-        let g = GrooveEngine::new(120.0); // 500 ms per beat
-        // 750 ms is between beat 1 (500ms) and beat 2 (1000ms) — closer to beat 2
-        let q = g.quantize(750.0);
-        assert!((q - 1000.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn groove_quantize_snaps_to_zero() {
-        let g = GrooveEngine::new(120.0);
-        let q = g.quantize(200.0); // closer to beat 0 (0ms)
-        assert!((q - 0.0).abs() < 1e-9);
-    }
-
-    // ── clock_sync ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn clock_sync_new_unsynced() {
-        let cs = ClockSync::new();
-        assert!(!cs.is_synced);
-        assert!(cs.external_bpm.is_none());
-    }
-
-    #[test]
-    fn clock_sync_on_start_sets_synced() {
-        let mut cs = ClockSync::new();
-        cs.on_start();
-        assert!(cs.is_synced);
-    }
-
-    #[test]
-    fn clock_sync_on_stop_unsynced() {
-        let mut cs = ClockSync::new();
-        cs.on_start();
-        cs.on_stop();
-        assert!(!cs.is_synced);
-    }
-
-    #[test]
-    fn clock_sync_on_clock_tick_accumulates() {
-        let mut cs = ClockSync::new();
-        cs.on_start();
-        // Feed 24 ticks 1ms apart (BPM should be 60*24/0.023 ≈ 2500)
-        for i in 0..24u64 {
-            cs.on_clock_tick(i as f64 * 0.001);
+    #[test] fn note_on_all_channels() {
+        for ch in 0u8..16 {
+            let m = MidiMessage::NoteOn { channel: ch, pitch: 60, velocity: 80 };
+            assert_eq!(rt(&m), m);
         }
-        // After 24 ticks BPM should be set
-        assert!(cs.external_bpm.is_some());
     }
-
-    #[test]
-    fn clock_sync_current_bpm_requires_synced() {
-        let mut cs = ClockSync::new();
-        // Feed ticks without starting
-        for i in 0..24u64 {
-            cs.on_clock_tick(i as f64 * 0.001);
-        }
-        // Even with bpm set, current_bpm returns None when not synced
-        cs.on_stop();
-        assert!(cs.current_bpm().is_none());
-    }
-
-    // ── io ──────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn midi_buffer_push_and_len() {
-        let mut buf = MidiBuffer::new();
-        let ev = MidiEvent::NoteOn(NoteOn { pitch: 60, velocity: 100, channel: 0, timestamp: 0.0 });
-        buf.push(0.0, ev);
-        assert_eq!(buf.events.len(), 1);
-    }
-
-    #[test]
-    fn midi_buffer_events_in_range() {
-        let mut buf = MidiBuffer::new();
-        let make_on = |t: f64| {
-            MidiEvent::NoteOn(NoteOn { pitch: 60, velocity: 100, channel: 0, timestamp: t })
-        };
-        buf.push(0.0, make_on(0.0));
-        buf.push(0.5, make_on(0.5));
-        buf.push(1.0, make_on(1.0));
-        let range = buf.events_in_range(0.0, 1.0);
-        assert_eq!(range.len(), 2); // [0.0, 1.0) excludes t=1.0
-    }
-
-    #[test]
-    fn midi_buffer_encode_buffer() {
-        let mut buf = MidiBuffer::new();
-        buf.push(
-            0.0,
-            MidiEvent::NoteOn(NoteOn { pitch: 60, velocity: 100, channel: 0, timestamp: 0.0 }),
-        );
-        buf.push(0.1, MidiEvent::Clock); // should be skipped
-        let bytes = buf.encode_buffer();
-        assert_eq!(bytes, vec![0x90, 60, 100]);
-    }
-
-    #[test]
-    fn midi_buffer_clear() {
-        let mut buf = MidiBuffer::new();
-        buf.push(
-            0.0,
-            MidiEvent::NoteOn(NoteOn { pitch: 60, velocity: 100, channel: 0, timestamp: 0.0 }),
-        );
-        buf.clear();
-        assert!(buf.events.is_empty());
+    #[test] fn active_sensing_round_trip() { assert_eq!(rt(&MidiMessage::ActiveSensing), MidiMessage::ActiveSensing); }
+    #[test] fn control_change_tensor() {
+        let m = MidiMessage::ControlChange { channel: 0, controller: 64, value: 64 };
+        let t = midi_to_tensor(&m, 0.0).unwrap();
+        assert!((t.pitch_norm - 64.0/127.0).abs() < 1e-9);
     }
 }

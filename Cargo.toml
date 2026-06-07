@@ -2,10 +2,8 @@
 name = "band-midi-rs"
 version = "0.1.0"
 edition = "2021"
-description = "MIDI I/O, tensor mapping, and groove timing for autonomous band agents"
+description = "MIDI I/O and tensor coordinate mapping for Self-Improving Band"
 license = "MIT"
 repository = "https://github.com/SuperInstance/band-midi-rs"
-keywords = ["music", "midi", "tensor", "groove", "audio"]
-categories = ["multimedia::audio", "encoding"]
-
-[dependencies]
+keywords = ["midi", "music", "tensor", "mapping", "band"]
+categories = ["multimedia::audio"]
